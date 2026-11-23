@@ -139,20 +139,20 @@ def test_failed_write_leaves_previous_state(client, monkeypatch, mods):
 
     import app.chronology as chronology
 
-    real_rebuild = chronology._rebuild_year
+    real_maintain = chronology._maintain_year
 
-    def boom(conn, year):
+    def boom(conn, year, old_x2, new_x2, metrics):
         if year == 1950:
             raise sqlite3.OperationalError("simulated failure")
-        return real_rebuild(conn, year)
+        return real_maintain(conn, year, old_x2, new_x2, metrics)
 
-    monkeypatch.setattr(chronology, "_rebuild_year", boom)
+    monkeypatch.setattr(chronology, "_maintain_year", boom)
     r = client.post(
         "/reports",
         json={"cores": [core(2, 1, {1950: 777})]},
     )
     assert r.status_code == 500
-    monkeypatch.setattr(chronology, "_rebuild_year", real_rebuild)
+    monkeypatch.setattr(chronology, "_maintain_year", real_maintain)
 
     after = get_year(client, 1950)
     assert after["value"] == before["value"]

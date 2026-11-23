@@ -12,6 +12,7 @@ from .chronology import (
     apply_report,
     get_core_series,
     list_trees,
+    migrate_if_legacy,
     query_reference,
 )
 from .db import init_db, read_data_version, read_snapshot
@@ -30,6 +31,10 @@ from .settings import settings
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db(settings.db_path)
+    # Upgrade any legacy cumulative-histogram volume before the first request
+    # so queries never see a half-old/half-new storage layout. A failed
+    # migration rolls back and is retried on the next process start.
+    migrate_if_legacy(str(settings.db_path))
     yield
 
 
@@ -40,8 +45,11 @@ app = FastAPI(
         "按树号、芯号报送逐年整数轮宽指数，并按年份查询树轮年表参考值。\n\n"
         "参考值算法：先对每棵树当年各芯指数取中位数，再对入选树的株内中位数取中位数。\n\n"
         "查询可选 `exclude_tree` 临时剔除一棵待核树，不读取原始取芯明细，"
-        "只访问按年聚合的累计直方图（访问记录数随样本树数次线性增长）。\n\n"
-        "报送与年表在同一事务内生效；任何失败都回滚到报送前的状态。"
+        "只访问按年聚合的稀疏 Fenwick 树（每次次序统计固定 O(32) 次主键点查，"
+        "读取量与样本树数次线性）。\n\n"
+        "报送只增量维护受影响的株内中位数和 Fenwick 节点：单株取芯变动时，"
+        "维护该年分布所扫描和改写的记录数不随该年样本树数增长。报送、迁移与年表在同一事务内"
+        "生效；任何失败都回滚到报送前的状态。"
     ),
     lifespan=lifespan,
 )
@@ -53,9 +61,17 @@ def health() -> HealthOut:
         with read_snapshot(settings.db_path, restricted=False) as session:
             row = session.fetchone(
                 "SELECT COUNT(*) AS n FROM sqlite_master "
-                "WHERE type='table' AND name IN ('year_stat','tree_year','year_value_cum')"
+                "WHERE type='table' AND name IN ('year_stat','tree_year','year_value_bit')"
             )
             schema_ok = row is not None and int(row["n"]) == 3
+            # A volume still carrying the pre-v2 histogram is a legacy volume
+            # that has not been migrated; report degraded rather than serve
+            # nonsensical reads against the missing Fenwick table.
+            legacy = session.fetchone(
+                "SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='year_value_cum'"
+            )
+            if legacy is not None:
+                schema_ok = False
         version = read_data_version(settings.db_path)
     except sqlite3.Error as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=503, detail=f"database unavailable: {exc}") from exc

@@ -2,12 +2,25 @@
 
 Two kinds of connections are used:
 
-* writer connections (one per ingest request) open with ``BEGIN IMMEDIATE``;
+* writer connections (one per ingest request, or the one-time schema
+  migration) open with ``BEGIN IMMEDIATE``;
 * reader connections are opened ``mode=ro``, wrapped in a deferred read
   transaction so every read in a request sees one committed snapshot, and
   carry an authorizer that only permits reads from the small aggregate tables.
   Raw core/measurement tables are deliberately *not* readable from these
   connections.
+
+Aggregate storage
+-----------------
+``tree_year``       one row per (year, tree): the tree's within-tree median,
+                    stored doubled so an even number of cores stays exact.
+``year_stat``       one row per year that still has sample trees: tree count.
+``year_value_bit``  sparse Fenwick (binary indexed) tree over the doubled
+                    median values of a year. Only nodes with a non-zero count
+                    are stored, so a single median change touches at most
+                    ``BITS`` (=32) rows even when the year holds tens of
+                    thousands of sample trees, and order-statistic selection
+                    reads at most ``BITS`` point lookups.
 """
 
 from __future__ import annotations
@@ -24,8 +37,13 @@ from urllib.parse import quote
 # Tables the reference endpoint is allowed to read. Everything else (notably
 # `measurement` and `core`) is denied by the SQLite authorizer.
 ALLOWED_READ_TABLES: frozenset[str] = frozenset(
-    {"year_stat", "tree_year", "year_value_cum", "meta", "sqlite_master", "sqlite_temp_master"}
+    {"year_stat", "tree_year", "year_value_bit", "meta", "sqlite_master", "sqlite_temp_master"}
 )
+
+# Current on-disk schema generation. Stored in meta(key='schema_version').
+SCHEMA_VERSION = 2
+LEGACY_HISTOGRAM_TABLE = "year_value_cum"
+BIT_TABLE = "year_value_bit"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -34,6 +52,7 @@ CREATE TABLE IF NOT EXISTS meta (
 ) WITHOUT ROWID;
 
 INSERT OR IGNORE INTO meta(key, value) VALUES ('data_version', '0');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '2');
 
 CREATE TABLE IF NOT EXISTS core (
     tree_no      INTEGER NOT NULL CHECK (tree_no >= 1),
@@ -69,28 +88,30 @@ CREATE TABLE IF NOT EXISTS tree_year (
 
 CREATE INDEX IF NOT EXISTS tree_year_by_tree
     ON tree_year(tree_no, year);
-CREATE INDEX IF NOT EXISTS tree_year_value
-    ON tree_year(year, median_x2);
 
--- One row per year. tree_count is the number of sampled trees; slot_count is
--- the number of distinct median values in year_value_cum.
+-- One row per year that currently has at least one sampled tree. Rows are
+-- deleted when the last tree leaves the year, so a re-report that empties a
+-- year leaves no stale aggregate behind.
 CREATE TABLE IF NOT EXISTS year_stat (
     year       INTEGER PRIMARY KEY CHECK (year BETWEEN 1 AND 9999),
-    tree_count INTEGER NOT NULL CHECK (tree_count >= 1),
-    slot_count INTEGER NOT NULL CHECK (slot_count >= 1)
+    tree_count INTEGER NOT NULL CHECK (tree_count >= 1)
 ) WITHOUT ROWID;
 
--- Cumulative histogram of per-tree medians for a year. One row per distinct
--- value (slot). `cum` is the number of tree medians <= value_x2, which makes
--- order-statistic selection possible with O(log slot_count) point lookups.
-CREATE TABLE IF NOT EXISTS year_value_cum (
-    year     INTEGER NOT NULL,
-    slot     INTEGER NOT NULL CHECK (slot >= 1),
-    value_x2 INTEGER NOT NULL CHECK (value_x2 >= 0),
-    cnt      INTEGER NOT NULL CHECK (cnt >= 1),
-    cum      INTEGER NOT NULL CHECK (cum >= 1),
-    PRIMARY KEY (year, slot),
-    UNIQUE (year, value_x2)
+-- Sparse Fenwick tree of per-tree medians (doubled) for a year.
+--
+-- A median value v is stored at BIT index v + 1. Node n covers the value
+-- indices in (n - lowbit(n), n]; `cnt` is the number of tree medians falling
+-- in that range. Nodes whose count would be zero are deleted, so the table
+-- only ever holds rows that contribute to a prefix sum.
+--
+-- Adding/removing one median walks at most BITS (=32) parent nodes; selecting
+-- the k-th smallest median walks at most BITS nodes. Both costs are
+-- independent of the number of sample trees in the year.
+CREATE TABLE IF NOT EXISTS year_value_bit (
+    year INTEGER NOT NULL CHECK (year BETWEEN 1 AND 9999),
+    node INTEGER NOT NULL CHECK (node >= 1),
+    cnt  INTEGER NOT NULL CHECK (cnt >= 1),
+    PRIMARY KEY (year, node)
 ) WITHOUT ROWID;
 """
 
@@ -186,8 +207,20 @@ def read_snapshot(path: str | os.PathLike[str], *, restricted: bool = True) -> I
             conn.close()
 
 
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
 def init_db(path: str | os.PathLike[str]) -> None:
-    """Create the schema if needed and ensure WAL mode."""
+    """Create the schema if needed and ensure WAL mode.
+
+    This only creates *current-schema* objects. A volume still carrying the
+    legacy cumulative-histogram table is detected separately and upgraded by
+    :func:`app.chronology.migrate_legacy_schema` inside a transaction.
+    """
     p = _db_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=30.0, isolation_level=None)

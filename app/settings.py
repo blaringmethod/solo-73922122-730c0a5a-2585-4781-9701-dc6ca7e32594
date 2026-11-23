@@ -11,7 +11,7 @@ from pathlib import Path
 class Settings:
     db_path: Path
     app_name: str = "林芯 · 树轮年表 API"
-    version: str = "1.0.0"
+    version: str = "2.0.0"
 
 
 def get_settings() -> Settings:

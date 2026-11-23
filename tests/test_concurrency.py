@@ -20,18 +20,18 @@ def test_report_rolls_back_on_injected_failure(mods, monkeypatch):
     )
     before = chronology.query_reference(path, 2000, None)
 
-    real = chronology._rebuild_year
+    real = chronology._maintain_year
 
-    def boom(conn, year):
+    def boom(conn, year, old_x2, new_x2, metrics):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(chronology, "_rebuild_year", boom)
+    monkeypatch.setattr(chronology, "_maintain_year", boom)
     with pytest.raises(sqlite3.OperationalError):
         apply_report(
             path,
             ReportRequest(cores=[{"tree_no": 1, "core_no": 1, "years": {"2000": 99}}]),
         )
-    monkeypatch.setattr(chronology, "_rebuild_year", real)
+    monkeypatch.setattr(chronology, "_maintain_year", real)
 
     after = chronology.query_reference(path, 2000, None)
     assert after["value"] == before["value"]
@@ -161,11 +161,13 @@ def test_reader_sees_single_version_during_writes(mods):
     assert all(count == 50 for _, count in seen_versions)
 
     # Every observed (data_version, aggregate triplet) must be internally
-    # consistent: slots' counts sum to the year's tree count and to the number
-    # of tree_year rows, i.e. no half-committed write was ever visible.
+    # consistent: the Fenwick root node (index = 2**32) counts every tree
+    # median, so its count equals both the year tree count and the number of
+    # tree_year rows -- no half-committed write was ever visible.
     with mods["db"].read_snapshot(path, restricted=False) as session:
         a = session.fetchone(
-            "SELECT SUM(cnt) AS s FROM year_value_cum WHERE year=1980"
+            "SELECT cnt AS s FROM year_value_bit "
+            "WHERE year=1980 AND node = 4294967296"
         )["s"]
         b = session.fetchone("SELECT tree_count FROM year_stat WHERE year=1980")["tree_count"]
         c = session.fetchone(

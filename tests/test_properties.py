@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-import math
 import random
 import statistics
 
 import pytest
 
+BITS = 32
+
 
 def expected_rows_bound(sample_trees: int) -> int:
-    """Loose upper bound for rows read by one reference query."""
-    return 4 * int(math.ceil(math.log2(max(sample_trees, 1) + 1))) + 12
+    """Loose upper bound for rows read by one reference query.
+
+    The Fenwick order statistic costs a fixed BITS (=32) node probes per
+    selection, so the bound is a constant with a small slack for the
+    year_stat/tree_year/meta lookups.
+    """
+    return 6 * BITS + 40
 
 
 def post_report(client, cores):
@@ -110,9 +116,10 @@ def test_read_cost_sublinear_and_aggregate_only(client, mods):
     assert result["sample_trees"] == n - 1
     assert result["value"] == 100.0
     assert result["read_cost"]["rows_read"] <= expected_rows_bound(n)
-    assert result["read_cost"]["slot_probes"] <= 2
+    # One odd-count order statistic over a sparse Fenwick tree.
+    assert result["read_cost"]["slot_probes"] == BITS
 
-    # Distinct medians: rows read still only logarithmic.
+    # Distinct medians: rows read still only a constant number of probes.
     cores = [
         {"tree_no": t, "core_no": 1, "years": {"2021": t}}
         for t in range(1, 5001)
@@ -137,9 +144,9 @@ def test_query_plan_uses_only_seeks(client, mods):
     conn = mods["db"].connect_read(mods["path"], restricted=False)
     try:
         plans = {
-            "stat": "SELECT tree_count, slot_count FROM year_stat WHERE year=?",
+            "stat": "SELECT tree_count FROM year_stat WHERE year=?",
             "tree": "SELECT median_x2 FROM tree_year WHERE year=? AND tree_no=?",
-            "slot": "SELECT slot, value_x2, cnt, cum FROM year_value_cum WHERE year=? AND slot=?",
+            "bit": "SELECT cnt FROM year_value_bit WHERE year=? AND node=?",
             "version": "SELECT value FROM meta WHERE key=?",
         }
         for name, sql in plans.items():
@@ -147,7 +154,7 @@ def test_query_plan_uses_only_seeks(client, mods):
                 params = (2020,)
             elif name == "tree":
                 params = (2020, 1)
-            elif name == "slot":
+            elif name == "bit":
                 params = (2020, 1)
             else:
                 params = ("data_version",)
@@ -186,8 +193,8 @@ def test_schema_stores_no_per_tree_excluded_answers(client, mods):
         "core": {"tree_no", "core_no", "revision", "updated_at", "data_version"},
         "measurement": {"tree_no", "core_no", "year", "index_value"},
         "tree_year": {"year", "tree_no", "median_x2", "core_count"},
-        "year_stat": {"year", "tree_count", "slot_count"},
-        "year_value_cum": {"year", "slot", "value_x2", "cnt", "cum"},
+        "year_stat": {"year", "tree_count"},
+        "year_value_bit": {"year", "node", "cnt"},
     }
     conn = mods["db"].connect_read(mods["path"], restricted=False)
     try:

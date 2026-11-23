@@ -9,6 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 YEAR_MIN = 1
 YEAR_MAX = 9999
 
+# Inclusive upper bound for a reported index value. Within-tree medians are
+# stored doubled, so the largest doubled median is 2 * MAX_INDEX_VALUE; it must
+# still fit the Fenwick value domain (indices 1..2**32, all signed-64-safe).
+MAX_INDEX_VALUE = (1 << 31) - 1
+
 
 class CoreReport(BaseModel):
     """One core's full yearly index series. Re-reporting replaces it entirely."""
@@ -46,6 +51,10 @@ class CoreReport(BaseModel):
                 raise ValueError(f"year {year} outside {YEAR_MIN}..{YEAR_MAX}")
             if idx < 0:
                 raise ValueError(f"year {year}: index must be a non-negative integer")
+            if idx > MAX_INDEX_VALUE:
+                raise ValueError(
+                    f"year {year}: index {idx} exceeds supported maximum {MAX_INDEX_VALUE}"
+                )
         return value
 
 
